@@ -208,12 +208,23 @@ export interface LiveDraftRecommendationsInput {
 
 export interface LiveDraftRecommendation {
   player: DraftPlanPlayer;
+  rank: number;
   score: number;
+  vorp: number;
+  vona: number;
+  survival_to_next: number;
+  adp: number;
+  projected_points: number;
+  urgency: "take_now" | "wait" | "even";
   reasons: string[];
 }
 
 export interface LiveDraftRecommendationsResult {
-  overall_pick: number;
-  round: number;
+  overall_pick: number | null;
+  round: number | null;
+  complete: boolean;
+  picks_until_next: number;
+  starters_per_team: Record<string, number>;
+  roster_targets: Record<string, number>;
   recommendations: LiveDraftRecommendation[];
 }

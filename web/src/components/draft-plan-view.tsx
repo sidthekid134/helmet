@@ -8,10 +8,11 @@ import {
   LoaderCircle,
   RefreshCw,
   RotateCcw,
+  Search,
   Sparkles,
   Undo2,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type {
   DraftPlanCandidate,
@@ -20,15 +21,17 @@ import type {
   DraftPlanPlayer,
   LeagueConnection,
   LiveDraftRecommendation,
+  LiveDraftRecommendationsResult,
 } from "@/lib/contracts";
 import { useApi } from "@/hooks/use-api";
 import { EmptyState } from "@/components/states";
 
 const POSITIONS = ["QB", "RB", "WR", "TE"] as const;
-// Stable reference so `current?.node.roster_player_ids ?? EMPTY_ROSTER` never
-// creates a fresh array on every render -- that would defeat the `useMemo`
-// in `LiveDraftBoard` and re-fetch recommendations on every keystroke.
-const EMPTY_ROSTER: string[] = [];
+const URGENCY_LABEL: Record<LiveDraftRecommendation["urgency"], string> = {
+  take_now: "Take now",
+  wait: "Wait",
+  even: "Even",
+};
 
 interface FormState {
   leagueId: string;
@@ -79,9 +82,8 @@ export function DraftPlanView() {
   // every candidate list (across all nodes) so the modeled options stay
   // honest even when reality diverges from the precomputed tree.
   const [takenByOthers, setTakenByOthers] = useState<Record<string, string>>({});
-  // Players drafted through the live board specifically (not by clicking
-  // through the precomputed Explorer tree below). Merged with the
-  // Explorer's own roster-so-far when computing "who's actually left".
+  // Actual live-draft roster. The prep tree below is hypothetical and must
+  // not advance "your next pick" when you click through a simulated branch.
   const [myLivePicks, setMyLivePicks] = useState<DraftPlanPlayer[]>([]);
 
   const current = steps[steps.length - 1] ?? null;
@@ -163,11 +165,11 @@ export function DraftPlanView() {
     <>
       <div className="page-header">
         <div>
-          <span className="eyebrow">Pre-draft strategy</span>
+          <span className="eyebrow">Draft-day aid</span>
           <h1>Draft plan</h1>
           <p>
-            Explore a simulated draft tree: pick a player, see who survives opponent picks
-            until your next turn, and drill into every branch before draft day.
+            Log picks as they happen. Helmet re-ranks who is left and tells you why the next
+            pick is that one.
           </p>
         </div>
         {plan && (
@@ -193,7 +195,6 @@ export function DraftPlanView() {
         <>
           <LiveDraftBoard
             planId={plan.plan.id}
-            treeRosterPlayerIds={current?.node.roster_player_ids ?? EMPTY_ROSTER}
             myLivePicks={myLivePicks}
             takenByOthers={takenByOthers}
             onDraftMine={draftMine}
@@ -201,18 +202,25 @@ export function DraftPlanView() {
             onMarkOthers={markTakenPlayer}
             onUnmarkOthers={unmarkTaken}
           />
-          <PlanExplorer
-            plan={plan.plan}
-            steps={steps}
-            current={current}
-            navigating={navigating}
-            navError={navError}
-            takenByOthers={takenByOthers}
-            onOpenCandidate={openCandidate}
-            onJumpTo={jumpTo}
-            onMarkTaken={markTaken}
-            onUnmarkTaken={unmarkTaken}
-          />
+          <details className="prep-tree">
+            <summary>
+              <GitBranch size={14} />
+              Prep tree
+              <span>Explore hypothetical branches without changing the live board.</span>
+            </summary>
+            <PlanExplorer
+              plan={plan.plan}
+              steps={steps}
+              current={current}
+              navigating={navigating}
+              navError={navError}
+              takenByOthers={takenByOthers}
+              onOpenCandidate={openCandidate}
+              onJumpTo={jumpTo}
+              onMarkTaken={markTaken}
+              onUnmarkTaken={unmarkTaken}
+            />
+          </details>
         </>
       )}
     </>
@@ -401,7 +409,6 @@ function PlanForm({
 
 function LiveDraftBoard({
   planId,
-  treeRosterPlayerIds,
   myLivePicks,
   takenByOthers,
   onDraftMine,
@@ -410,7 +417,6 @@ function LiveDraftBoard({
   onUnmarkOthers,
 }: {
   planId: string;
-  treeRosterPlayerIds: string[];
   myLivePicks: DraftPlanPlayer[];
   takenByOthers: Record<string, string>;
   onDraftMine: (player: DraftPlanPlayer) => void;
@@ -419,60 +425,101 @@ function LiveDraftBoard({
   onUnmarkOthers: (playerId: string) => void;
 }) {
   const myRosterPlayerIds = useMemo(
-    () => Array.from(new Set([...treeRosterPlayerIds, ...myLivePicks.map((player) => player.id)])),
-    [treeRosterPlayerIds, myLivePicks],
+    () => myLivePicks.map((player) => player.id),
+    [myLivePicks],
   );
-
+  const previousRanks = useRef<Record<string, number>>({});
+  const [query, setQuery] = useState("");
+  const [positionFilter, setPositionFilter] = useState<(typeof POSITIONS)[number] | "ALL">("ALL");
   const [refreshToken, setRefreshToken] = useState(0);
+  const [refreshing, setRefreshing] = useState(true);
+  const [rankDeltas, setRankDeltas] = useState<Record<string, number>>({});
+  const [movedIds, setMovedIds] = useState<Set<string>>(new Set());
   const [fetchState, setFetchState] = useState<
-    | { status: "loading"; overallPick: null; round: null; recommendations: LiveDraftRecommendation[] }
-    | { status: "success"; overallPick: number; round: number; recommendations: LiveDraftRecommendation[] }
-    | {
-        status: "error";
-        overallPick: number | null;
-        round: number | null;
-        recommendations: LiveDraftRecommendation[];
-        error: Error;
-      }
-  >({ status: "loading", overallPick: null, round: null, recommendations: [] });
+    | { status: "loading"; data: LiveDraftRecommendationsResult | null }
+    | { status: "success"; data: LiveDraftRecommendationsResult }
+    | { status: "error"; data: LiveDraftRecommendationsResult | null; error: Error }
+  >({ status: "loading", data: null });
 
   useEffect(() => {
     let cancelled = false;
+    const movedTimer: { id?: number } = {};
     api
       .liveDraftRecommendations(planId, {
         my_roster_player_ids: myRosterPlayerIds,
         taken_by_others_player_ids: Object.keys(takenByOthers),
+        limit: 80,
       })
       .then((response) => {
-        if (!cancelled) {
-          setFetchState({
-            status: "success",
-            overallPick: response.data.overall_pick,
-            round: response.data.round,
-            recommendations: response.data.recommendations,
-          });
+        if (cancelled) return;
+        const recs = response.data.recommendations;
+        const nextDeltas: Record<string, number> = {};
+        const moved = new Set<string>();
+        if (Object.keys(previousRanks.current).length > 0) {
+          for (const rec of recs) {
+            const previous = previousRanks.current[rec.player.id];
+            if (previous != null && previous !== rec.rank) {
+              nextDeltas[rec.player.id] = previous - rec.rank;
+              moved.add(rec.player.id);
+            }
+          }
+        }
+        previousRanks.current = Object.fromEntries(
+          recs.map((rec) => [rec.player.id, rec.rank]),
+        );
+        setRankDeltas(nextDeltas);
+        setMovedIds(moved);
+        setFetchState({ status: "success", data: response.data });
+        if (moved.size > 0) {
+          movedTimer.id = window.setTimeout(() => setMovedIds(new Set()), 900);
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           setFetchState((prev) => ({
             status: "error",
-            overallPick: prev.overallPick,
-            round: prev.round,
-            recommendations: prev.recommendations,
+            data: prev.data,
             error: err instanceof Error ? err : new Error("Could not load live recommendations"),
           }));
         }
+      })
+      .finally(() => {
+        if (!cancelled) setRefreshing(false);
       });
     return () => {
       cancelled = true;
+      if (movedTimer.id !== undefined) window.clearTimeout(movedTimer.id);
     };
   }, [planId, myRosterPlayerIds, takenByOthers, refreshToken]);
 
-  const loading = fetchState.status === "loading";
+  const loading = fetchState.status === "loading" && fetchState.data === null;
   const error = fetchState.status === "error" ? fetchState.error : null;
-  const { recommendations, overallPick, round } = fetchState;
-  const [top, ...rest] = recommendations;
+  const data = fetchState.data;
+  const complete = data?.complete ?? false;
+  const overallPick = data?.overall_pick ?? null;
+  const round = data?.round ?? null;
+  const picksUntilNext = data?.picks_until_next ?? 0;
+  const starters = data?.starters_per_team ?? {};
+  const targets = data?.roster_targets ?? {};
+  const hiddenIds = useMemo(() => {
+    return new Set([...myRosterPlayerIds, ...Object.keys(takenByOthers)]);
+  }, [myRosterPlayerIds, takenByOthers]);
+  const visible = useMemo(
+    () => (data?.recommendations ?? []).filter((row) => !hiddenIds.has(row.player.id)),
+    [data, hiddenIds],
+  );
+  const top = visible[0] ?? null;
+  const needle = query.trim().toLowerCase();
+  const filtered = visible.filter((row) => {
+    if (positionFilter !== "ALL" && row.player.position !== positionFilter) return false;
+    if (!needle) return true;
+    return (
+      row.player.name.toLowerCase().includes(needle) ||
+      row.player.team.toLowerCase().includes(needle) ||
+      row.player.position.toLowerCase().includes(needle)
+    );
+  });
+  const listRows = filtered.filter((row) => row.player.id !== top?.player.id);
 
   return (
     <div className="draft-layout">
@@ -481,99 +528,204 @@ function LiveDraftBoard({
           <div>
             <h2>Live draft board</h2>
             <p>
-              {overallPick
-                ? `Your next pick: overall #${overallPick} (round ${round}) — re-ranked from every
-                  player still on the board.`
-                : "Re-ranked from every player still on the board, not a fixed top 10."}
+              {complete
+                ? "Every pick in this plan is logged."
+                : overallPick
+                  ? `On the clock: overall #${overallPick} (round ${round})${
+                      picksUntilNext > 0 ? ` · ${picksUntilNext} picks until you're back` : ""
+                    }`
+                  : "Re-ranked from every player still on the board."}
             </p>
           </div>
           <button
             type="button"
             className="secondary-button"
-            onClick={() => setRefreshToken((n) => n + 1)}
+            onClick={() => {
+              setRefreshing(true);
+              setRefreshToken((n) => n + 1);
+            }}
           >
-            <RefreshCw size={14} className={loading ? "spin" : undefined} />
-            Refresh
+            <RefreshCw size={14} className={refreshing ? "spin" : undefined} />
+            {refreshing && data ? "Updating…" : "Refresh"}
           </button>
         </div>
 
         {error && <div className="inline-error" role="alert">{error.message}</div>}
 
-        {recommendations.length === 0 ? (
+        {!complete && (
+        <div className="live-toolbar">
+          <label className="field-search">
+            <Search size={16} />
+            <input
+              aria-label="Search available players"
+              placeholder="Search to mark taken"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <div className="live-chips">
+            <button
+              type="button"
+              className={positionFilter === "ALL" ? "live-chip active" : "live-chip"}
+              onClick={() => setPositionFilter("ALL")}
+            >
+              All
+            </button>
+            {POSITIONS.map((position) => (
+              <button
+                key={position}
+                type="button"
+                className={positionFilter === position ? "live-chip active" : "live-chip"}
+                onClick={() => setPositionFilter(position)}
+              >
+                {position}
+              </button>
+            ))}
+          </div>
+        </div>
+        )}
+
+        {complete ? (
           <EmptyState
-            title={loading ? "Loading…" : "No recommendations yet"}
-            description={loading ? "Ranking the current board." : "Log a pick to get started."}
+            title="Draft complete"
+            description="Your roster is full for this plan. Undo a pick if you need to keep ranking."
+          />
+        ) : loading ? (
+          <EmptyState title="Loading…" description="Ranking the current board." />
+        ) : visible.length === 0 ? (
+          <EmptyState
+            title="No recommendations yet"
+            description="Log a pick, or refresh after the board has players left."
           />
         ) : (
           <>
             {top && (
               <div className="live-pick-highlight">
-                <span className="eyebrow">Recommended pick</span>
-                <div className="player-cell grow">
-                  <span className="player-avatar">{top.player.name.slice(0, 2).toUpperCase()}</span>
-                  <div>
-                    <strong>{top.player.name}</strong>
-                    <span>
-                      {top.player.position} · {top.player.team} · {top.reasons.join(" · ")}
-                    </span>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={() => onDraftMine(top.player)}
-                >
-                  <Check size={14} />I drafted this
-                </button>
-                <button
-                  type="button"
-                  className="plan-candidate-mark"
-                  onClick={() => onMarkOthers(top.player)}
-                >
-                  <Ban size={12} />
-                  Taken
-                </button>
-              </div>
-            )}
-            <div className="plan-candidate-list">
-              {rest.map((recommendation, index) => (
-                <div key={recommendation.player.id} className="plan-candidate">
-                  <span className="rank">{index + 2}</span>
+                <div className="live-pick-body">
+                  <span className="eyebrow">Recommended pick</span>
                   <div className="player-cell grow">
-                    <span className="player-avatar">
-                      {recommendation.player.name.slice(0, 2).toUpperCase()}
-                    </span>
+                    <span className="player-avatar">{top.player.name.slice(0, 2).toUpperCase()}</span>
                     <div>
-                      <strong>{recommendation.player.name}</strong>
+                      <strong>{top.player.name}</strong>
                       <span>
-                        {recommendation.player.position} · {recommendation.player.team} ·{" "}
-                        {recommendation.reasons.join(" · ")}
+                        {top.player.position} · {top.player.team} · ADP {top.adp.toFixed(0)}
                       </span>
                     </div>
                   </div>
-                  <div className="plan-candidate-metrics">
-                    <span>Score</span>
-                    <strong>{recommendation.score.toFixed(1)}</strong>
-                  </div>
+                  <ul className="why-list">
+                    {top.reasons.slice(0, 4).map((reason) => (
+                      <li key={reason}>{reason}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="live-pick-actions">
+                  <span className={`urgency-badge ${top.urgency}`}>
+                    {URGENCY_LABEL[top.urgency]}
+                  </span>
                   <button
                     type="button"
-                    className="plan-candidate-mark undo"
-                    onClick={() => onDraftMine(recommendation.player)}
+                    className="primary-button"
+                    onClick={() => {
+                      setRefreshing(true);
+                      onDraftMine(top.player);
+                    }}
                   >
-                    <Check size={12} />
-                    Mine
+                    <Check size={14} />I drafted this
                   </button>
                   <button
                     type="button"
                     className="plan-candidate-mark"
-                    onClick={() => onMarkOthers(recommendation.player)}
+                    onClick={() => {
+                      setRefreshing(true);
+                      onMarkOthers(top.player);
+                    }}
                   >
                     <Ban size={12} />
                     Taken
                   </button>
                 </div>
-              ))}
-            </div>
+              </div>
+            )}
+            {filtered.length === 0 && visible.length > 0 ? (
+              <EmptyState
+                title="No players match"
+                description="Clear search or switch positions to keep marking the board."
+              />
+            ) : (
+              <div className="plan-candidate-list">
+                {listRows.map((recommendation) => {
+                  const delta = rankDeltas[recommendation.player.id] ?? 0;
+                  const moved = movedIds.has(recommendation.player.id);
+                  return (
+                    <div
+                      key={recommendation.player.id}
+                      className={
+                        moved
+                          ? delta > 0
+                            ? "plan-candidate moved-up"
+                            : "plan-candidate moved-down"
+                          : "plan-candidate"
+                      }
+                    >
+                      <span className="rank">{recommendation.rank}</span>
+                      {delta !== 0 && (
+                        <span className={delta > 0 ? "rank-delta up" : "rank-delta down"}>
+                          {delta > 0 ? `↑${delta}` : `↓${Math.abs(delta)}`}
+                        </span>
+                      )}
+                      <div className="player-cell grow">
+                        <span className="player-avatar">
+                          {recommendation.player.name.slice(0, 2).toUpperCase()}
+                        </span>
+                        <div>
+                          <strong>{recommendation.player.name}</strong>
+                          <span>
+                            {recommendation.player.position} · {recommendation.player.team}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="plan-candidate-metrics">
+                        <span>ADP</span>
+                        <strong>{recommendation.adp.toFixed(0)}</strong>
+                      </div>
+                      <div className="plan-candidate-metrics">
+                        <span>VORP</span>
+                        <strong>{recommendation.vorp.toFixed(0)}</strong>
+                      </div>
+                      <div className="plan-candidate-metrics">
+                        <span>Survive</span>
+                        <strong>{Math.round(recommendation.survival_to_next * 100)}%</strong>
+                      </div>
+                      <span className={`urgency-badge ${recommendation.urgency}`}>
+                        {URGENCY_LABEL[recommendation.urgency]}
+                      </span>
+                      <button
+                        type="button"
+                        className="plan-candidate-mark undo"
+                        onClick={() => {
+                          setRefreshing(true);
+                          onDraftMine(recommendation.player);
+                        }}
+                      >
+                        <Check size={12} />
+                        Mine
+                      </button>
+                      <button
+                        type="button"
+                        className="plan-candidate-mark"
+                        onClick={() => {
+                          setRefreshing(true);
+                          onMarkOthers(recommendation.player);
+                        }}
+                      >
+                        <Ban size={12} />
+                        Taken
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </>
         )}
       </section>
@@ -584,9 +736,11 @@ function LiveDraftBoard({
             <span className="eyebrow">
               <Sparkles size={13} /> Draft log
             </span>
-            <h2>{overallPick ? `Pick #${overallPick}` : "Draft log"}</h2>
+            <h2>{overallPick ? `Pick #${overallPick}` : complete ? "Complete" : "Draft log"}</h2>
           </div>
         </div>
+
+        <RosterSlotGrid picks={myLivePicks} starters={starters} targets={targets} />
 
         <div className="panel-heading">
           <div>
@@ -605,7 +759,10 @@ function LiveDraftBoard({
                 <button
                   type="button"
                   className="plan-candidate-mark undo"
-                  onClick={() => onUndoMine(player.id)}
+                  onClick={() => {
+                    setRefreshing(true);
+                    onUndoMine(player.id);
+                  }}
                 >
                   <Undo2 size={12} />
                   Undo
@@ -630,7 +787,10 @@ function LiveDraftBoard({
                 <button
                   type="button"
                   className="plan-candidate-mark undo"
-                  onClick={() => onUnmarkOthers(playerId)}
+                  onClick={() => {
+                    setRefreshing(true);
+                    onUnmarkOthers(playerId);
+                  }}
                 >
                   <Undo2 size={12} />
                   Undo
@@ -640,6 +800,38 @@ function LiveDraftBoard({
           </div>
         )}
       </aside>
+    </div>
+  );
+}
+
+function RosterSlotGrid({
+  picks,
+  starters,
+  targets,
+}: {
+  picks: DraftPlanPlayer[];
+  starters: Record<string, number>;
+  targets: Record<string, number>;
+}) {
+  return (
+    <div className="roster-slot-grid">
+      {POSITIONS.map((position) => {
+        const have = picks.filter((player) => player.position === position);
+        const starterCount = starters[position] ?? 0;
+        const targetCount = targets[position] ?? starterCount;
+        return (
+          <div key={position} className={have.length >= starterCount ? "roster-slot filled" : "roster-slot"}>
+            <span>{position}</span>
+            <strong>
+              {have.length}/{starterCount}
+            </strong>
+            <small>target {targetCount}</small>
+            {have.length > 0 && (
+              <em>{have.map((player) => player.name.split(" ").slice(-1)[0]).join(", ")}</em>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

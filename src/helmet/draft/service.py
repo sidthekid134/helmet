@@ -8,9 +8,11 @@ raise rather than silently falling back to something plausible-looking.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from typing import Any
+from dataclasses import dataclass
+from random import Random
+from typing import Any, Literal
 
 from helmet.analytics import (
     PlayerProjection,
@@ -20,7 +22,9 @@ from helmet.analytics import (
 )
 from helmet.persistence import PersistenceContext
 from helmet.projections import (
+    ProjectionPool,
     ProjectionSettings,
+    ScoringTranslation,
     build_projection_pool,
     projection_model_version,
     translate_sleeper_scoring,
@@ -30,7 +34,13 @@ from helmet.research import active_projection_modifiers
 
 from .branch import BranchPolicy
 from .context import DraftContext
-from .opponent import DEFAULT_ADP_STDEV, DEFAULT_CONSIDERATION_WINDOW, AdpOpponentModel
+from .opponent import (
+    DEFAULT_ADP_STDEV,
+    DEFAULT_CONSIDERATION_WINDOW,
+    AdpOpponentModel,
+    OpponentModel,
+    simulate_gap_survival,
+)
 from .persistence import find_existing_plan, persist_draft_tree
 from .roster_shape import derive_draft_shape
 from .tree import build_draft_tree
@@ -43,6 +53,36 @@ _STARTER_SHORTFALL_WEIGHT = 20.0
 _BENCH_SHORTFALL_WEIGHT = 2.0
 _BYE_OVERLAP_PENALTY = 1.0
 _ADP_REACH_WEIGHT = 0.1
+# VONA is the snake-draft question: how many points do you lose at this
+# position if you wait a round. Added at full weight so a cliff outweighs a
+# similar VORP at a position that will still be there.
+_VONA_SURVIVAL_FLOOR = 0.5
+_URGENCY_WEIGHT = 8.0
+_TAKE_NOW_SURVIVAL = 0.4
+_WAIT_SURVIVAL = 0.7
+
+LiveUrgency = Literal["take_now", "wait", "even"]
+
+DEFAULT_LIVE_SIMULATION_ITERATIONS = 40
+DEFAULT_LIVE_LIMIT = 80
+
+# In-process projection pools keyed by plan_id. Live ranking recomputes VORP
+# and survival on every mark-taken; reloading nflverse for that would make
+# the board pop instead of shuffle.
+_POOL_CACHE: dict[str, tuple[str, ProjectionPool]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class LiveBoardRank:
+    """One ranked live-board row, with the snake-draft numbers behind the why."""
+
+    score: float
+    item: ScoredProjection
+    vona: float
+    survival_to_next: float
+    urgency: LiveUrgency
+    reasons: tuple[str, ...]
+
 
 DEFAULT_TOP_K_BY_ROUND: Mapping[int, int] = {1: 8, 2: 5, 3: 4}
 DEFAULT_INDIVIDUAL_ROUNDS = 3
@@ -224,23 +264,196 @@ def precompute_all_draft_plans(
     return results
 
 
-def _rank_for_live_board(
+def clear_projection_pool_cache() -> None:
+    """Drop cached live-board pools. Tests call this between cases."""
+    _POOL_CACHE.clear()
+
+
+def _pool_fingerprint(plan_id: str, config: Mapping[str, Any], season: int) -> str:
+    return canonical_content_hash(
+        {
+            "plan_id": plan_id,
+            "season": season,
+            "projection_model_version": config["projection_model_version"],
+            "applied_modifiers": config["applied_modifiers"],
+            "sleeper_scoring_settings": config["sleeper_scoring_settings"],
+        }
+    )
+
+
+def _projection_pool_for_plan(
+    plan_id: str,
+    *,
+    config: Mapping[str, Any],
+    season: int,
+    scoring: ScoringTranslation,
+) -> ProjectionPool:
+    fingerprint = _pool_fingerprint(plan_id, config, season)
+    cached = _POOL_CACHE.get(plan_id)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    pool = build_projection_pool(
+        scoring=scoring,
+        settings=ProjectionSettings(
+            target_season=season, lookback_seasons=tuple(range(season - 2, season))
+        ),
+        modifiers=config["applied_modifiers"],
+    )
+    _POOL_CACHE[plan_id] = (fingerprint, pool)
+    return pool
+
+
+def _next_at_position(
+    item: ScoredProjection,
+    by_position: Mapping[str, Sequence[ScoredProjection]],
+    survival: Mapping[str, float],
+) -> ScoredProjection | None:
+    """The next-best same-position player likely to still be there next round.
+
+    Players are already sorted by projected points. Majority-survival (≥ 0.5)
+    is the same canonical-pool rule the tree uses; if nobody clears it, the
+    next player at the position is the fallback so VONA still measures a
+    real drop-off instead of inventing a replacement.
+    """
+    others = [
+        candidate
+        for candidate in by_position[item.player.position]
+        if candidate.player.player_id != item.player.player_id
+    ]
+    likely = [
+        candidate
+        for candidate in others
+        if survival.get(candidate.player.player_id, 0.0) >= _VONA_SURVIVAL_FLOOR
+    ]
+    if likely:
+        return likely[0]
+    return others[0] if others else None
+
+
+def _slot_reason(
+    position: str,
+    *,
+    have: int,
+    starters_needed: int,
+    bench_target: int,
+) -> str:
+    next_count = have + 1
+    if have < starters_needed:
+        return f"Fills open {position}{next_count} starter"
+    if have < bench_target:
+        return f"{position} depth {next_count} of {bench_target}"
+    return f"{position} target already met"
+
+
+def _survival_reason(survival: float, gap_size: int) -> str:
+    if gap_size <= 0:
+        return "On the clock now — no wait"
+    percent = round(survival * 100)
+    gone = 100 - percent
+    if survival < _TAKE_NOW_SURVIVAL:
+        return f"Gone by next pick ({gone}%)"
+    if survival > _WAIT_SURVIVAL:
+        return f"Likely waits (survival {percent}%)"
+    return f"Risky — {percent}% survive to next pick"
+
+
+def _adp_reason(overall_pick: int, adp: float) -> str:
+    delta = overall_pick - adp
+    if delta >= 2:
+        return f"falling to you (ADP {adp:.0f})"
+    if delta <= -2:
+        return f"slight reach (ADP {adp:.0f})"
+    return f"on ADP ({adp:.0f})"
+
+
+def _urgency_for(survival: float, gap_size: int) -> LiveUrgency:
+    if gap_size <= 0:
+        return "even"
+    if survival < _TAKE_NOW_SURVIVAL:
+        return "take_now"
+    if survival > _WAIT_SURVIVAL:
+        return "wait"
+    return "even"
+
+
+def _complete_live_board(context: DraftContext) -> dict[str, Any]:
+    return {
+        "overall_pick": None,
+        "round": None,
+        "complete": True,
+        "picks_until_next": 0,
+        "starters_per_team": dict(context.starters_per_team),
+        "roster_targets": dict(context.roster_targets),
+        "recommendations": [],
+    }
+
+
+def _recommendation_payload(rank: int, entry: LiveBoardRank) -> dict[str, Any]:
+    player = entry.item.player
+    if player.adp is None:
+        raise ValueError(f"{player.player_id} has no ADP; live ranking requires it")
+    return {
+        "player": {
+            "id": player.player_id,
+            "name": player.name,
+            "team": player.team,
+            "position": player.position,
+        },
+        "rank": rank,
+        "score": entry.score,
+        "vorp": entry.item.vorp,
+        "vona": entry.vona,
+        "survival_to_next": entry.survival_to_next,
+        "adp": player.adp,
+        "projected_points": entry.item.projected_points,
+        "urgency": entry.urgency,
+        "reasons": list(entry.reasons),
+    }
+
+
+def rank_for_live_board(
     available: Sequence[ScoredProjection],
     *,
     roster: Sequence[PlayerProjection],
     roster_targets: Mapping[str, int],
     starters_per_team: Mapping[str, int],
     overall_pick: int,
-) -> list[tuple[float, ScoredProjection, tuple[str, ...]]]:
-    """Rank by VORP plus a need bonus that treats an empty starting spot as
-    urgent and a wanted bench spot as a mild tiebreaker -- unlike a single
-    flat need bonus, this can actually outweigh a small VORP gap.
+    survival: Mapping[str, float],
+    gap_size: int,
+) -> list[LiveBoardRank]:
+    """Rank remaining players the way a snake-draft aid should.
+
+    Score is VORP plus VONA (drop-off vs the next same-position player likely
+    to survive the gap) plus starter/bench need, a small gone-before-next
+    urgency term, ADP-reach, and a bye-overlap penalty. Reasons are the
+    human "why this pick" strings, not a metric dump.
     """
+    if not available:
+        raise ValueError("no players remain available")
     have_counts = Counter(player.position for player in roster)
     bye_counts = Counter(player.bye_week for player in roster)
-    ranked: list[tuple[float, ScoredProjection, tuple[str, ...]]] = []
+    by_position: dict[str, list[ScoredProjection]] = defaultdict(list)
+    for item in available:
+        by_position[item.player.position].append(item)
+    for position, rows in by_position.items():
+        by_position[position] = sorted(
+            rows, key=lambda item: (-item.projected_points, item.player.player_id)
+        )
+
+    ranked: list[LiveBoardRank] = []
     for item in available:
         player = item.player
+        if player.adp is None:
+            raise ValueError(f"{player.player_id} has no ADP; live ranking requires it")
+        survival_to_next = survival.get(player.player_id)
+        if survival_to_next is None:
+            raise ValueError(f"{player.player_id} is missing from the survival map")
+        nxt = _next_at_position(item, by_position, survival)
+        vona = (
+            item.projected_points - nxt.projected_points
+            if nxt is not None
+            else item.projected_points
+        )
         have = have_counts[player.position]
         starters_needed = starters_per_team.get(player.position, 0)
         bench_target = roster_targets.get(player.position, starters_needed)
@@ -252,20 +465,120 @@ def _rank_for_live_board(
         )
         bye_overlap = bye_counts[player.bye_week]
         bye_cost = bye_overlap * _BYE_OVERLAP_PENALTY
-        reach = max(overall_pick - player.adp, 0.0) if player.adp is not None else 0.0
-        score = item.vorp + need_bonus + reach * _ADP_REACH_WEIGHT - bye_cost
-        reasons = [f"VORP {item.vorp:.1f}"]
-        if starter_shortfall > 0:
-            reasons.append(f"fills an open {player.position} starting spot")
-        elif bench_shortfall > 0:
-            reasons.append(f"{player.position} bench need {bench_shortfall}")
-        else:
-            reasons.append(f"{player.position} target already met")
-        if bye_overlap:
-            reasons.append(f"bye overlap {bye_overlap}")
-        ranked.append((score, item, tuple(reasons)))
-    ranked.sort(key=lambda entry: (-entry[0], entry[1].player.player_id))
+        reach = max(overall_pick - player.adp, 0.0)
+        urgency = _urgency_for(survival_to_next, gap_size)
+        score = (
+            item.vorp
+            + vona
+            + need_bonus
+            + (1.0 - survival_to_next) * _URGENCY_WEIGHT
+            + reach * _ADP_REACH_WEIGHT
+            - bye_cost
+        )
+        vona_label = f"{vona:+.0f} VONA vs next {player.position}"
+        reasons = (
+            vona_label,
+            _slot_reason(
+                player.position,
+                have=have,
+                starters_needed=starters_needed,
+                bench_target=bench_target,
+            ),
+            _survival_reason(survival_to_next, gap_size),
+            _adp_reason(overall_pick, player.adp),
+            *((f"bye overlap {bye_overlap}",) if bye_overlap else ()),
+        )
+        ranked.append(
+            LiveBoardRank(
+                score=score,
+                item=item,
+                vona=vona,
+                survival_to_next=survival_to_next,
+                urgency=urgency,
+                reasons=reasons,
+            )
+        )
+    ranked.sort(key=lambda entry: (-entry.score, entry.item.player.player_id))
     return ranked
+
+
+def live_board_from_pool(
+    *,
+    context: DraftContext,
+    pool: Sequence[PlayerProjection],
+    my_roster_player_ids: Sequence[str],
+    taken_by_others_player_ids: Sequence[str],
+    opponent_model: OpponentModel | None = None,
+    simulation_iterations: int = DEFAULT_LIVE_SIMULATION_ITERATIONS,
+    seed: int = DEFAULT_SEED,
+    limit: int = DEFAULT_LIVE_LIMIT,
+) -> dict[str, Any]:
+    """Rank a known pool for the caller's next snake pick.
+
+    Split out from `live_pick_recommendations` so tests can exercise VONA,
+    need, survival, and the completed-draft payload without rebuilding
+    nflverse or touching the database.
+    """
+    my_picks = context.my_picks()
+    picks_made = len(my_roster_player_ids)
+    if picks_made >= len(my_picks):
+        return _complete_live_board(context)
+
+    overall_pick = my_picks[picks_made]
+    next_pick = my_picks[picks_made + 1] if picks_made + 1 < len(my_picks) else None
+    gap_size = (next_pick - overall_pick - 1) if next_pick is not None else 0
+
+    by_id = {player.player_id: player for player in pool}
+    roster: list[PlayerProjection] = []
+    for player_id in my_roster_player_ids:
+        try:
+            roster.append(by_id[player_id])
+        except KeyError as exc:
+            raise ValueError(
+                f"roster player {player_id} is not in this plan's projection pool"
+            ) from exc
+
+    taken = set(my_roster_player_ids) | set(taken_by_others_player_ids)
+    available = [player for player in pool if player.player_id not in taken]
+    if not available:
+        raise ValueError("no players remain available")
+    replacement_points = replacement_levels(
+        available, context.scoring, context.num_teams, context.starters_per_team
+    )
+    scored_available = value_over_replacement(available, context.scoring, replacement_points)
+
+    start_pick = overall_pick + 1
+    slots = [context.team_slot_for_pick(start_pick + offset) for offset in range(gap_size)]
+    survival = simulate_gap_survival(
+        opponent_model=opponent_model or AdpOpponentModel(),
+        available=available,
+        start_pick=start_pick,
+        gap_size=gap_size,
+        slots=slots,
+        iterations=simulation_iterations,
+        rng=Random(seed),
+    )
+    ranked = rank_for_live_board(
+        scored_available,
+        roster=roster,
+        roster_targets=context.roster_targets,
+        starters_per_team=context.starters_per_team,
+        overall_pick=overall_pick,
+        survival=survival,
+        gap_size=gap_size,
+    )
+    return {
+        "overall_pick": overall_pick,
+        "round": context.round_of(overall_pick),
+        "complete": False,
+        "picks_until_next": gap_size,
+        "starters_per_team": dict(context.starters_per_team),
+        "roster_targets": dict(context.roster_targets),
+        "recommendations": [
+            _recommendation_payload(rank, entry)
+            for rank, entry in enumerate(ranked[:limit], start=1)
+        ],
+    }
 
 
 def live_pick_recommendations(
@@ -274,7 +587,7 @@ def live_pick_recommendations(
     plan_id: str,
     my_roster_player_ids: Sequence[str],
     taken_by_others_player_ids: Sequence[str],
-    limit: int = 25,
+    limit: int = DEFAULT_LIVE_LIMIT,
 ) -> dict[str, Any]:
     """Rank the actual remaining pool for the picker's actual next turn.
 
@@ -290,8 +603,12 @@ def live_pick_recommendations(
 
     Replacement levels are recomputed against the *currently available*
     pool, not the plan's original one, so VORP reflects real draft-time
-    scarcity (a thinning position's replacement level rises as it empties
-    out) instead of a value fixed at generation time.
+    scarcity. Survival through the gap to the next pick is simulated with
+    the same ADP opponent model the tree uses, at a smaller iteration count
+    so the board can re-rank as picks come off.
+
+    The projection pool is cached per plan so marking a player taken does
+    not reload nflverse.
     """
     plan_row = DraftPlanRepository(db.client, db.owner_user_id).get(plan_id)
     league_id = plan_row["league_id"]
@@ -302,15 +619,7 @@ def live_pick_recommendations(
 
     config = plan_row["config"]
     scoring = translate_sleeper_scoring(config["sleeper_scoring_settings"])
-    pool = build_projection_pool(
-        scoring=scoring,
-        settings=ProjectionSettings(
-            target_season=season, lookback_seasons=tuple(range(season - 2, season))
-        ),
-        modifiers=config["applied_modifiers"],
-    )
-    by_id = pool.by_id()
-
+    pool = _projection_pool_for_plan(plan_id, config=config, season=season, scoring=scoring)
     context = DraftContext(
         num_teams=config["num_teams"],
         my_slot=config["my_slot"],
@@ -319,47 +628,19 @@ def live_pick_recommendations(
         starters_per_team=config["starters_per_team"],
         scoring=scoring.settings,
     )
-    my_picks = context.my_picks()
-    picks_made = len(my_roster_player_ids)
-    if picks_made >= len(my_picks):
-        raise ValueError(f"all {len(my_picks)} of your picks in this plan are already logged")
-    overall_pick = my_picks[picks_made]
-
-    taken = set(my_roster_player_ids) | set(taken_by_others_player_ids)
-    available = [player for player in pool.players if player.player_id not in taken]
-    if not available:
-        raise ValueError("no players remain available")
-    replacement_points = replacement_levels(
-        available, scoring.settings, config["num_teams"], config["starters_per_team"]
+    opponent = config.get("opponent_model", {})
+    return live_board_from_pool(
+        context=context,
+        pool=pool.players,
+        my_roster_player_ids=my_roster_player_ids,
+        taken_by_others_player_ids=taken_by_others_player_ids,
+        opponent_model=AdpOpponentModel(
+            default_stdev=opponent.get("default_stdev", DEFAULT_ADP_STDEV),
+            consideration_window=opponent.get(
+                "consideration_window", DEFAULT_CONSIDERATION_WINDOW
+            ),
+        ),
+        simulation_iterations=DEFAULT_LIVE_SIMULATION_ITERATIONS,
+        seed=config.get("seed", DEFAULT_SEED),
+        limit=limit,
     )
-    scored_available = value_over_replacement(available, scoring.settings, replacement_points)
-
-    roster = [by_id[player_id] for player_id in my_roster_player_ids]
-    ranked = _rank_for_live_board(
-        scored_available,
-        roster=roster,
-        roster_targets=config["roster_targets"],
-        starters_per_team=config["starters_per_team"],
-        overall_pick=overall_pick,
-    )
-
-    recommendations = []
-    for _score, item, reasons in ranked[:limit]:
-        player = item.player
-        recommendations.append(
-            {
-                "player": {
-                    "id": player.player_id,
-                    "name": player.name,
-                    "team": player.team,
-                    "position": player.position,
-                },
-                "score": _score,
-                "reasons": list(reasons),
-            }
-        )
-    return {
-        "overall_pick": overall_pick,
-        "round": context.round_of(overall_pick),
-        "recommendations": recommendations,
-    }
