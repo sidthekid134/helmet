@@ -1,0 +1,33 @@
+name: helmet
+prefect-version: 3.8.4
+
+build: []
+push: []
+pull: []
+
+deployments:
+  - name: daily-preseason-sync
+    entrypoint: src/helmet/flows/pipelines.py:daily_preseason_flow
+    parameters:
+      league_id: "{{ prefect.variables.helmet_league_id }}"
+    schedules:
+      - cron: "0 10 * * *"
+        timezone: America/New_York
+        active: true
+
+  - name: weekly-league-sync
+    entrypoint: src/helmet/flows/pipelines.py:weekly_sync_flow
+    parameters:
+      league_id: "{{ prefect.variables.helmet_league_id }}"
+    schedules:
+      - cron: "0 */6 * * 2-7"
+        timezone: America/New_York
+        active: true
+
+  - name: active-draft-poll
+    entrypoint: src/helmet/flows/pipelines.py:active_draft_flow
+    parameters:
+      league_id: "{{ prefect.variables.helmet_league_id }}"
+    schedules:
+      - interval: 60
+        active: false

@@ -1,0 +1,81 @@
+{
+  "model_version": "2026.0.0",
+  "generated_at": "2026-08-28T01:02:17.592653+00:00",
+  "training_seasons": [
+    2024,
+    2025
+  ],
+  "target_season": 2026,
+  "findings": [
+    {
+      "hypothesis": "350+ touch RB hangover",
+      "status": "not_supported",
+      "effect_size": 0.0531,
+      "sample_size": 35,
+      "confidence": 0.25,
+      "evidence": "Difference in next-season PPR points per touch versus 150\u2013349 touch RBs",
+      "required_sources": [
+        "nflverse.player_stats"
+      ]
+    },
+    {
+      "hypothesis": "RB peak-age curve",
+      "status": "insufficient_evidence",
+      "effect_size": null,
+      "sample_size": 0,
+      "confidence": 0,
+      "evidence": "Birth-date coverage and cohort survival adjustment require validation",
+      "required_sources": [
+        "nflverse.rosters",
+        "nflverse.player_stats"
+      ]
+    },
+    {
+      "hypothesis": "Offensive-line continuity",
+      "status": "insufficient_evidence",
+      "effect_size": null,
+      "sample_size": 0,
+      "confidence": 0,
+      "evidence": "No validated offensive-line starter source is configured",
+      "required_sources": [
+        "validated.offensive_line_starters"
+      ]
+    },
+    {
+      "hypothesis": "Pressure-to-sack volatility",
+      "status": "insufficient_evidence",
+      "effect_size": null,
+      "sample_size": 0,
+      "confidence": 0,
+      "evidence": "Pressure attribution coverage has not been validated",
+      "required_sources": [
+        "nflverse.play_by_play"
+      ]
+    },
+    {
+      "hypothesis": "Wind penalty above threshold",
+      "status": "insufficient_evidence",
+      "effect_size": null,
+      "sample_size": 0,
+      "confidence": 0,
+      "evidence": "No validated point-in-time weather source is configured",
+      "required_sources": [
+        "validated.weather",
+        "nflverse.schedules"
+      ]
+    },
+    {
+      "hypothesis": "Opponent manager behavior",
+      "status": "insufficient_evidence",
+      "effect_size": null,
+      "sample_size": 0,
+      "confidence": 0,
+      "evidence": "Requires the connected league's historical transaction data",
+      "required_sources": [
+        "sleeper.transactions",
+        "sleeper.drafts"
+      ]
+    }
+  ],
+  "promoted_modifiers": {}
+}
