@@ -24,10 +24,14 @@ from .roster_shape import (
     derive_starters_per_team,
 )
 from .service import (
+    LiveBoardRank,
+    clear_projection_pool_cache,
     default_branch_policy,
     generate_draft_plan,
+    live_board_from_pool,
     live_pick_recommendations,
     precompute_all_draft_plans,
+    rank_for_live_board,
 )
 from .tree import DraftTree, DraftTreeCandidate, DraftTreeNode, build_draft_tree
 from .value import RosterValue, ValueModel, VorpValueModel
@@ -45,21 +49,25 @@ __all__ = [
     "DraftTree",
     "DraftTreeCandidate",
     "DraftTreeNode",
+    "LiveBoardRank",
     "OpponentModel",
     "RosterValue",
     "ValueModel",
     "VorpValueModel",
     "build_draft_tree",
+    "clear_projection_pool_cache",
     "default_branch_policy",
     "derive_draft_shape",
     "derive_roster_targets",
     "derive_starters_per_team",
     "find_existing_plan",
     "generate_draft_plan",
+    "live_board_from_pool",
     "live_pick_recommendations",
     "persist_draft_tree",
     "precompute_all_draft_plans",
     "rank_available",
+    "rank_for_live_board",
     "select_branch_candidates",
     "simulate_gap_survival",
 ]

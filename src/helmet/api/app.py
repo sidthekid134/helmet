@@ -65,7 +65,7 @@ class DraftPlanInput(BaseModel):
 class LiveDraftRecommendationsInput(BaseModel):
     my_roster_player_ids: list[str] = Field(default_factory=list)
     taken_by_others_player_ids: list[str] = Field(default_factory=list)
-    limit: int = Field(default=25, ge=1, le=100)
+    limit: int = Field(default=80, ge=1, le=200)
 
 
 def envelope(data: Any, *, league_id: str | None = None) -> dict[str, Any]:
